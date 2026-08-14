@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arcaeon-meter"
+version = "0.1.0"
+description = "Meter your agent tool in 3 lines: keys, monthly caps, SQLite counts, billing export. Keyed metering without billing infrastructure."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Arcaeon" }]
+keywords = ["ai", "agents", "metering", "api-keys", "usage", "rate-limit", "billing", "monetization", "mcp"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Libraries",
+]
+dependencies = []
+
+[project.optional-dependencies]
+ledger = ["arcaeon-ledger>=0.5"]
+
+[project.scripts]
+arcaeon-meter = "arcaeon_meter.cli:main"
+
+[project.urls]
+Homepage = "https://arcaeon.io"
+
+[tool.hatch.build.targets.wheel]
+packages = ["arcaeon_meter"]
