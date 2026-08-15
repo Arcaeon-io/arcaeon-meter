@@ -1,5 +1,96 @@
 # Changelog — arcaeon-meter
 
+## Unreleased — property-fuzzing regression suite (2026-08-15)
+
+Test-only; no product-logic change (the property pass found no billing bug — the counting invariants held under fuzzing, which is the result being recorded).
+
+- **New `test_property_meter.py`.** A seeded 5000-operation property loop over a random roster (6–14 keys with mixed cap configs — finite caps, explicit-unlimited, plan-deferred, and misconfigured fail-closed) driving random `check`/peek/deny with random costs, checked against an independent in-memory oracle on every op. Asserts the four money invariants: counts **exact + monotonic**, **no cross-key contamination** (each key's stored/exported count equals its own oracle and only its own), **cap never exceeded** (an over-cap call is a typed `over_cap` denial that does not increment), and **a denied call never increments** (unknown/malformed/revoked/over-cap/no-cap). Result on the committed seed: `grant_cost_sum == billed`, zero drift. Plus (1) a **ledger receipt invariant** run — with `ledger=` set, `sum(grant costs) − sum(void costs) == total billed count` and the chained usage log verifies GREEN; (2) a **prefix-collision** test proving two keys.json entries sharing a 12-hex display prefix keep separate counts and that an ambiguous prefix lookup refuses rather than guess; (3) a **concurrency property** — random `(cap, workers, load)` across real OS processes, asserting `grants == min(load, cap)` exactly, cap never exceeded. Scales via `METER_PROP_OPS`.
+
+## 0.1.2 — 2026-08-15
+
+Billing-integrity release, from a hostile audit of the *counting* (0.1.1 audited
+the fail-closed *denying*). The headline is a keyspace change, so it lands now,
+while the install base is small enough that "migrate everyone" is a sentence
+rather than a project.
+
+- **Counts key on the full sha256, not the 12-hex `key_id`.** That prefix is 48
+  bits. Two customers whose key hashes shared those 12 hex shared one `usage`
+  row: the busy one's calls appeared on BOTH invoices, and the quiet one's cap
+  was spent by traffic it never sent — silently, no error, wrong denials in both
+  directions. Birthday odds put a collision at ~50% around **16.7M keys**, which
+  is inside this product's own "millions of agents" pitch, not a footnote.
+  Reproduced with two REAL keys found by brute-force search (`am_probe3197488`
+  and `am_probe27007650`, both hashing to `fc98907cfe56…`), not a mock:
+
+  ```
+  0.1.1:  label=acme-BIG   key_id=fc98907cfe56  used=900  cap=1000
+          label=tiny-free  key_id=fc98907cfe56  used=900  cap=100     <- never called
+          tiny-free's very first call: DENIED reason=over_cap used=900
+  0.1.2:  label=acme-BIG   key_id=fc98907cfe56  used=900  cap=1000
+          label=tiny-free  key_id=fc98907cfe56  used=0    cap=100
+          tiny-free's very first call: GRANTED
+  ```
+
+  `key_id` remains the display prefix everywhere it was (CLI, `Allowance`,
+  `Usage`, export) — it is a label now, not an identity.
+
+- **Migration, and exactly what it can and cannot recover.** Opening a pre-0.1.2
+  database migrates it in one transaction. A legacy row whose prefix matches
+  **exactly one key in your keys file** carries over intact: the roster is the
+  whole universe of keys that could have incremented that row, so a single match
+  is provably its owner. A row whose prefix matches **two or more keys cannot be
+  split by anyone** — that merged row IS the defect, and truncation is not
+  reversible; there is no honest way to say which calls were whose. Same for a
+  prefix matching **no** key (a hand-deleted entry — `revoke` keeps entries, so
+  this is rare). Both unrecoverable cases are preserved as
+  `legacy_truncated_keyspace:<prefix>`, **excluded from `export()`** (nobody can
+  be honestly invoiced for a count with an unknown owner), and readable via
+  `meter.legacy_usage()`; the CLI `export` prints a warning to stderr when any
+  exist. Your original table is kept as `usage_pre_0_1_2` — nothing is dropped.
+  One caveat stated rather than papered over: if entries were DELETED from
+  keys.json after spending, a surviving key sharing their prefix inherits their
+  counts. Deletion already destroyed that evidence; the migration cannot invent
+  it back. If the keys file can't be read, the migration **refuses to run**
+  (loud `RuntimeError`) rather than zeroing every recoverable count.
+
+- **`export()` and `list_keys()` gained a `key_hash` column (full sha256) — a
+  format change.** Map customers on it, not on `key_id`: colliding prefixes
+  would otherwise point two customers' invoice rows at one mapping. It is the
+  same one-way hash already in `keys.json` — not a secret, not reversible to
+  one; plaintext secrets still appear nowhere. CSV header is now
+  `key_id,key_hash,label,plan,used,monthly_cap,revoked,month`. The Stripe recipe
+  and `examples/stripe_invoice_export.py` now key the customer map and the
+  idempotency key on `key_hash` (the example still accepts an old key_id-keyed
+  map so an existing mapping file keeps working).
+
+- **A `COMMIT` that fails after the ledger append now chains its inverse.** The
+  0.1.1 fix covered one direction of the two-store seam (ledger raises → count
+  rolls back). The other direction: the grant is chained, then `COMMIT` fails on
+  a full disk — SQLite has no such grant, but an append-only chain cannot have a
+  row removed, so the ledger stayed permanently ahead of the billed count while
+  `verify()` still reported `ok` (the chain was intact; the row was just
+  phantom). The recipe sells exactly that equality as "the receipt." Now a
+  `meter.void` row with `reason: "commit_failed"` is chained, and the stated
+  invariant is **grants − voids == the billed count** — documented in the README
+  and with a reconcile snippet in the recipe. If the void append fails too (same
+  dying disk), the ledger stays `+cost` ahead and that same reconcile is what
+  surfaces it; the caller sees the raised error either way.
+
+- **The ASGI middleware no longer bills CORS preflights.** `OPTIONS` was metered
+  like a call — and since browsers don't send `Authorization` on a preflight, it
+  was billed *and* answered 401, breaking the handshake it was inspecting.
+  `OPTIONS` is now passed through unmetered (`scope["arcaeon_meter"] = None`),
+  configurable via `meter.asgi_middleware(skip_methods=...)`. The rest of the
+  policy is now stated instead of implied: `HEAD` is billed by default (add it
+  to `skip_methods` if you disagree), and a request your handler answers 5xx is
+  still billed — the cap has to be spent before the work runs, which is what
+  makes it a cap and what makes it atomic across processes, and refunding would
+  need the negative cost that 0.1.1 deliberately removed.
+
+Not changed, still true: happy-path counting is exact and concurrency-safe
+(`2 processes × 200 → used=400, zero lost`; `cap=300 vs 400 attempts → exactly
+300 grants`), and this meter counts CALLS, not tokens.
+
 ## 0.1.1 — 2026-08-14
 
 Hostile audit of the fail-closed claim. It did not hold on five paths; it does

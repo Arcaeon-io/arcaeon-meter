@@ -142,13 +142,17 @@ def test_usage_and_export_billing_handoff():
         meter.check(s2)
         u = meter.usage(kid2)  # by key_id, not secret
         assert u.used == 2 and u.cap == 1000 and u.label == "carol"
+        assert u.key_hash == arcaeon_meter.key_hash(s2)  # full billing identity
         rows = json.loads(meter.export(fmt="json"))
         assert len(rows) == 2  # full roster, zero-usage keys included too
         by_id = {r["key_id"]: r for r in rows}
         assert by_id[kid]["used"] == 1 and by_id[kid2]["used"] == 2
+        assert by_id[kid2]["key_hash"] == arcaeon_meter.key_hash(s2)
+        assert all(r["key_hash"].startswith(r["key_id"]) for r in rows)
         csv_text = meter.export(fmt="csv")
         lines = csv_text.strip().splitlines()
-        assert lines[0] == "key_id,label,plan,used,monthly_cap,revoked,month"
+        assert lines[0] == ("key_id,key_hash,label,plan,used,monthly_cap,"
+                            "revoked,month")
         assert len(lines) == 3
         assert secret not in csv_text and s2 not in csv_text
     print("PASS usage(key_id) + export json/csv (full roster, no secrets)")
@@ -462,6 +466,222 @@ def test_ledger_failure_rolls_the_count_back():
     print("PASS a failed ledger write rolls the count back instead of over-billing")
 
 
+# Two REAL secrets whose sha256 share the first 12 hex, found by brute-force
+# birthday search (~27M draws). Nothing is mocked here: these are the actual
+# 48-bit collision the old truncated keyspace merged into one billing row.
+COLLIDE_A = "am_probe3197488"
+COLLIDE_B = "am_probe27007650"
+COLLIDE_PREFIX = "fc98907cfe56"
+
+
+def _collision_keys_file(d: Path) -> Path:
+    kp = d / "keys.json"
+    kp.write_text(json.dumps({"version": 1, "keys": {
+        arcaeon_meter.key_hash(COLLIDE_A): {
+            "plan": "pro", "monthly_cap": 1000, "label": "acme-BIG",
+            "revoked": False},
+        arcaeon_meter.key_hash(COLLIDE_B): {
+            "plan": "free", "monthly_cap": 100, "label": "tiny-free",
+            "revoked": False},
+    }}, indent=2), encoding="utf-8")
+    return kp
+
+
+def test_two_keys_sharing_a_key_id_prefix_bill_separately():
+    """The 12-hex key_id is 48 bits. Two customers colliding on it used to
+    share one `usage` row: the big one's 900 calls invoiced to BOTH, and the
+    free-tier key denied over_cap on its very first call. Counts key on the
+    full sha256 now; key_id is a display label."""
+    ha, hb = arcaeon_meter.key_hash(COLLIDE_A), arcaeon_meter.key_hash(COLLIDE_B)
+    assert ha != hb and ha[:12] == hb[:12] == COLLIDE_PREFIX, "probe keys stale"
+    with tempfile.TemporaryDirectory() as td:
+        meter = Meter(_collision_keys_file(Path(td)))
+        for _ in range(900):
+            assert meter.check(COLLIDE_A).ok
+        rows = {r["label"]: r for r in json.loads(meter.export())}
+        assert rows["acme-BIG"]["used"] == 900
+        assert rows["tiny-free"]["used"] == 0, "billed for another key's calls"
+        # both display the same key_id, so the invoice identity is key_hash
+        assert rows["acme-BIG"]["key_id"] == rows["tiny-free"]["key_id"]
+        assert rows["acme-BIG"]["key_hash"] != rows["tiny-free"]["key_hash"]
+        assert meter.usage(COLLIDE_B).used == 0
+        assert meter.check(COLLIDE_B).ok, "cap polluted by the other key"
+        assert meter.usage(COLLIDE_A).used == 900
+    print("PASS two keys sharing a 12-hex key_id count and bill SEPARATELY")
+
+
+def test_pre_0_1_2_db_migrates_what_it_can_and_strands_what_it_cannot():
+    """Old rows keyed on the 12-hex prefix. One roster match is provably that
+    key's usage and carries over; a prefix matching two keys (or none) cannot
+    be split by anyone, so it is preserved as legacy — never billed, never
+    silently dropped."""
+    import sqlite3
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        kp = _collision_keys_file(d)
+        solo, solo_kid = add_key(kp, plan="pro", monthly_cap=1000, label="solo")
+        db = d / "keys_usage.sqlite3"
+        con = sqlite3.connect(db, isolation_level=None)
+        con.execute("CREATE TABLE usage (key_id TEXT NOT NULL, "
+                    "month TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, "
+                    "PRIMARY KEY (key_id, month))")
+        con.executemany("INSERT INTO usage VALUES (?,?,?)", [
+            (solo_kid, "2026-08", 42),        # one roster match -> recoverable
+            (COLLIDE_PREFIX, "2026-08", 900),  # two matches -> unattributable
+            ("deadbeef0000", "2026-08", 7),    # no match -> unattributable
+        ])
+        con.close()
+
+        meter = Meter(kp)   # migration runs on open
+        assert meter.usage(solo, month="2026-08").used == 42, "lost real usage"
+        # the merged row is not handed to either colliding key
+        assert meter.usage(COLLIDE_A, month="2026-08").used == 0
+        assert meter.usage(COLLIDE_B, month="2026-08").used == 0
+        stranded = {r["legacy_key_id"]: r["used"]
+                    for r in meter.legacy_usage(month="2026-08")}
+        assert stranded == {COLLIDE_PREFIX: 900, "deadbeef0000": 7}, stranded
+        # nothing unattributable leaks into an invoice
+        assert all(r["used"] in (0, 42)
+                   for r in json.loads(meter.export(month="2026-08")))
+        # the original table is kept for forensics, not dropped
+        con = sqlite3.connect(db)
+        try:
+            names = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            assert "usage_pre_0_1_2" in names, names
+            assert con.execute("SELECT SUM(used) FROM usage_pre_0_1_2"
+                               ).fetchone()[0] == 949
+        finally:
+            con.close()
+        # idempotent: reopening does not re-migrate or double-count
+        assert Meter(kp).usage(solo, month="2026-08").used == 42
+    print("PASS pre-0.1.2 migration: single-match rows recovered, merged and "
+          "orphaned rows stranded as legacy (never billed)")
+
+
+def test_migration_refuses_to_run_without_a_readable_roster():
+    """Migrating blind would zero every recoverable count — i.e. hand every
+    customer their budget back. Fail loud instead."""
+    import sqlite3
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        kp = d / "keys.json"
+        secret, kid = add_key(kp, monthly_cap=100)
+        db = d / "keys_usage.sqlite3"
+        con = sqlite3.connect(db, isolation_level=None)
+        con.execute("CREATE TABLE usage (key_id TEXT NOT NULL, "
+                    "month TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0, "
+                    "PRIMARY KEY (key_id, month))")
+        con.execute("INSERT INTO usage VALUES (?,?,?)", (kid, "2026-08", 5))
+        con.close()
+        kp.write_text("{not json", encoding="utf-8")
+        try:
+            Meter(kp)
+            assert False, "migrated against an unreadable keys file"
+        except RuntimeError as e:
+            assert "truncated keyspace" in str(e)
+    print("PASS migration fails loud when the keys roster cannot be read")
+
+
+def test_commit_failure_after_ledger_append_chains_a_void():
+    """The other side of the ledger/SQLite seam: the grant row is chained,
+    then COMMIT fails, so SQLite has no such grant. The chained row cannot be
+    removed — so its inverse is chained. The receipt invariant becomes
+    grants MINUS voids == the billed count, and survives the half-write."""
+    try:
+        from arcaeon_ledger import Ledger
+    except ImportError:
+        print("SKIP commit-failure void (arcaeon-ledger not installed)")
+        return
+    import sqlite3
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        lg = d / "log.jsonl"
+        meter, kp, secret, kid = _mk(d, ledger=str(lg))
+        assert meter.check(secret).ok
+
+        real_connect = meter._connect
+
+        class CommitFails:
+            def __init__(self, con):
+                self._con = con
+
+            def execute(self, sql, *a):
+                if sql.strip().upper().startswith("COMMIT"):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._con.execute(sql, *a)
+
+            def close(self):
+                self._con.close()   # uncommitted work rolls back
+
+        meter._connect = lambda: CommitFails(real_connect())
+        try:
+            meter.check(secret)
+            assert False, "a failed COMMIT must not look like a grant"
+        except sqlite3.OperationalError:
+            pass
+        meter._connect = real_connect
+
+        assert meter.usage(kid).used == 1, "counted an uncommitted grant"
+        rows = list(Ledger(lg))
+        events = [r["event"] for r in rows]
+        assert events == ["meter.grant", "meter.grant", "meter.void"], events
+        assert rows[-1]["reason"] == "commit_failed"
+        grants = sum(1 for r in rows if r["event"] == "meter.grant")
+        voids = sum(1 for r in rows if r["event"] == "meter.void")
+        assert grants - voids == meter.usage(kid).used == 1
+        assert Ledger(lg).verify().ok   # chain intact, nothing removed
+    print("PASS a COMMIT failure after the ledger append chains a void: "
+          "grants - voids still equals the billed count")
+
+
+def test_asgi_does_not_bill_a_cors_preflight():
+    """An OPTIONS preflight is the browser asking whether it may call. It
+    carries no Authorization header, so metering it both billed a non-call
+    and answered 401 — which breaks the CORS handshake it was inspecting."""
+    with tempfile.TemporaryDirectory() as td:
+        meter, kp, secret, kid = _mk(Path(td))
+        seen = []
+
+        async def inner(scope, receive, send):
+            seen.append((scope["method"], scope["arcaeon_meter"]))
+            await send({"type": "http.response.start", "status": 204,
+                        "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        def call(app, method, auth=None):
+            scope = {"type": "http", "method": method, "path": "/",
+                     "headers": [(b"authorization", auth)] if auth else []}
+            sent = []
+
+            async def receive():
+                return {"type": "http.request"}
+
+            async def send(msg):
+                sent.append(msg)
+
+            asyncio.run(app(scope, receive, send))
+            return sent
+
+        app = meter.asgi_middleware()(inner)
+        pre = call(app, "OPTIONS")                       # no bearer, as browsers send
+        assert pre[0]["status"] == 204, pre[0]["status"]  # reached the app, not a 401
+        assert seen[-1] == ("OPTIONS", None)
+        assert meter.usage(kid).used == 0, "billed a CORS preflight"
+
+        # a real call still bills, and HEAD is billed by default (documented)
+        call(app, "GET", b"Bearer " + secret.encode())
+        call(app, "HEAD", b"Bearer " + secret.encode())
+        assert meter.usage(kid).used == 2, meter.usage(kid).used
+
+        # ...and the policy is the operator's to widen
+        app2 = meter.asgi_middleware(skip_methods=("OPTIONS", "HEAD"))(inner)
+        call(app2, "HEAD", b"Bearer " + secret.encode())
+        assert meter.usage(kid).used == 2, "skip_methods ignored"
+    print("PASS ASGI bills real calls only: CORS preflight passes through "
+          "unmetered, HEAD billable but skippable")
+
+
 def test_empty_identifier_never_resolves_to_a_key():
     with tempfile.TemporaryDirectory() as td:
         d = Path(td)
@@ -535,6 +755,11 @@ if __name__ == "__main__":
     test_entry_that_is_not_a_dict_denies()
     test_asgi_never_waves_through_an_unmetered_protocol()
     test_ledger_failure_rolls_the_count_back()
+    test_two_keys_sharing_a_key_id_prefix_bill_separately()
+    test_pre_0_1_2_db_migrates_what_it_can_and_strands_what_it_cannot()
+    test_migration_refuses_to_run_without_a_readable_roster()
+    test_commit_failure_after_ledger_append_chains_a_void()
+    test_asgi_does_not_bill_a_cors_preflight()
     test_empty_identifier_never_resolves_to_a_key()
     test_concurrent_revoke_is_not_erased_by_a_concurrent_add()
     print("ALL PASS")

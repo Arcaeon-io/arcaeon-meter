@@ -17,9 +17,16 @@ no Stripe package required.
 billing month — every key, zero-usage keys included, no secrets:
 
 ```json
-[{"key_id": "159564976fef", "label": "acme-co", "plan": "pro",
+[{"key_id": "159564976fef",
+  "key_hash": "159564976fef...<full sha256>", "label": "acme-co", "plan": "pro",
   "used": 7, "monthly_cap": null, "revoked": false, "month": "2026-08"}]
 ```
+
+**Map on `key_hash`.** `key_id` is a 12-hex display prefix (48 bits — two keys
+can share one at scale), so it is a label, not an identity. `key_hash` is the
+full sha256 the count is keyed on. It is safe to store next to your customer
+mapping: it's the same one-way hash already in `keys.json`, not a secret, and
+not reversible to one.
 
 Turning that into money owed requires three things `arcaeon-meter` deliberately
 does NOT do for you (see the package docstring: "Caps are enforcement; payment
@@ -67,7 +74,7 @@ meter.export(month, fmt="json")
 build_invoice_items(rows, customer_map, unit_amount_cents=...)   <- pure, no network
         |
         v
-stripe.InvoiceItem.create(..., idempotency_key=f"arcaeon-meter:{key_id}:{month}")
+stripe.InvoiceItem.create(..., idempotency_key=f"arcaeon-meter:{key_hash}:{month}")
         |
         v
 stripe.Invoice.create(customer=..., pending_invoice_items_behavior="include",
@@ -90,14 +97,17 @@ rows = json.loads(meter.export(month="2026-08", fmt="json"))
 def build_invoice_items(rows, customer_map, *, unit_amount_cents, currency="usd", month=None):
     items, skipped = [], []
     for row in rows:
-        kid, used = row["key_id"], row.get("used", 0)
+        # customer_map is keyed on key_hash (full sha256), NOT the 12-hex
+        # key_id: the prefix is 48 bits and two keys can share one, which
+        # would map two customers' invoices to whichever you stored last.
+        kh, kid, used = row["key_hash"], row["key_id"], row.get("used", 0)
         billing_month = row.get("month") or month
         if row.get("revoked") or used <= 0:
-            skipped.append({"key_id": kid, "reason": "revoked" if row.get("revoked") else "zero_usage"})
+            skipped.append({"key_hash": kh, "reason": "revoked" if row.get("revoked") else "zero_usage"})
             continue
-        customer_id = customer_map.get(kid)
+        customer_id = customer_map.get(kh)
         if not customer_id:
-            skipped.append({"key_id": kid, "reason": "no_customer_mapping"})
+            skipped.append({"key_hash": kh, "reason": "no_customer_mapping"})
             continue
         items.append({
             "customer": customer_id,
@@ -105,8 +115,8 @@ def build_invoice_items(rows, customer_map, *, unit_amount_cents, currency="usd"
             "quantity": used,
             "unit_amount_decimal": str(unit_amount_cents),
             "description": f"{row.get('label') or kid} - {used} call(s), {billing_month}",
-            "idempotency_key": f"arcaeon-meter:{kid}:{billing_month}",
-            "metadata": {"arcaeon_meter_key_id": kid, "arcaeon_meter_month": billing_month or ""},
+            "idempotency_key": f"arcaeon-meter:{kh}:{billing_month}",
+            "metadata": {"arcaeon_meter_key_hash": kh, "arcaeon_meter_month": billing_month or ""},
         })
     return items, skipped
 ```
@@ -126,7 +136,7 @@ for it in items:
     stripe.InvoiceItem.create(**kwargs, idempotency_key=it["idempotency_key"])
 ```
 
-`idempotency_key` is keyed on `(key_id, month)` — the natural primary key of a
+`idempotency_key` is keyed on `(key_hash, month)` — the natural primary key of a
 billing run. Re-run the whole export for a month you already billed (cron
 retried, you re-ran it by hand to double-check a number) and Stripe returns
 the *original* invoice item for each key instead of creating a duplicate. You
@@ -166,7 +176,8 @@ Real run, real output (`py examples/stripe_invoice_export.py --selftest`):
 meter.export() rows:
 [
   {
-    "key_id": "159564976fef",
+    "key_id": "00baee08c09e",
+    "key_hash": "00baee08c09e4c08bf1e53d6cc9736ed3cb6c86908ccd3989694196f684fecf8",
     "label": "acme-co",
     "plan": "pro",
     "used": 7,
@@ -175,7 +186,8 @@ meter.export() rows:
     "month": "2026-08"
   },
   {
-    "key_id": "4d9a31a7daed",
+    "key_id": "1ffc6f72100b",
+    "key_hash": "1ffc6f72100bcb6bdb1d649fbc750c67ed534501d3341a7554e9126e6fbaac43",
     "label": "never-called",
     "plan": "free",
     "used": 0,
@@ -184,7 +196,8 @@ meter.export() rows:
     "month": "2026-08"
   },
   {
-    "key_id": "e5a6731f9f63",
+    "key_id": "42939cff1127",
+    "key_hash": "42939cff1127b8ad195e8c919c2c3b2fd56bc083e6380d48fe6b036ee37163aa",
     "label": "beta-user",
     "plan": "free",
     "used": 3,
@@ -197,11 +210,11 @@ meter.export() rows:
 build_invoice_items() ->
 2 invoice item(s) to create, 1 key(s) skipped
 
-  + customer=cus_test_acme qty=7 unit_amount_decimal=5 idempotency_key=arcaeon-meter:159564976fef:2026-08
+  + customer=cus_test_acme qty=7 unit_amount_decimal=5 idempotency_key=arcaeon-meter:00baee08c09e4c08bf1e53d6cc9736ed3cb6c86908ccd3989694196f684fecf8:2026-08
     description: acme-co - 7 call(s), plan pro, 2026-08
-  + customer=cus_test_beta qty=3 unit_amount_decimal=5 idempotency_key=arcaeon-meter:e5a6731f9f63:2026-08
+  + customer=cus_test_beta qty=3 unit_amount_decimal=5 idempotency_key=arcaeon-meter:42939cff1127b8ad195e8c919c2c3b2fd56bc083e6380d48fe6b036ee37163aa:2026-08
     description: beta-user - 3 call(s), plan free, 2026-08
-  - skip key_id=4d9a31a7daed reason=zero_usage used=0
+  - skip key_id=1ffc6f72100b reason=zero_usage used=0
 
 PASS: 2 billable items, 1 skipped (zero_usage), idempotency keys stable across re-run
 ```
@@ -251,18 +264,47 @@ result = al.Ledger("usage_ledger.jsonl").verify()
 `ok=True` means every row's hash chains to the one before it — nobody edited,
 reordered, or deleted a grant event after the fact without breaking the chain
 at that exact row (`first_break` names it if so). `rows=7` matching the
-invoice's `quantity=7` is the receipt: the number on the Stripe invoice is the
+invoice's `quantity=7` is the receipt — **net of voids**, see below: the number
+on the Stripe invoice is the
 count of individually-chained, individually-timestamped grant events, not a
 number that could have been typed in or silently adjusted. That's the sell —
 not "trust our metering," but "here's the chain, verify it yourself."
 
-Two honest limits, stated plainly so this doesn't oversell: `verify()` proves
+Three honest limits, stated plainly so this doesn't oversell. `verify()` proves
 the ledger wasn't tampered with *after* being written — it doesn't prove your
 code called `meter.check()` on every real usage event in the first place (the
-gateway-completeness problem the package docstring already names). And the
+gateway-completeness problem the package docstring already names). The
 ledger is optional (`Meter(..., ledger=...)`, soft dep on `arcaeon-ledger`) —
 if you skip it, you're back to "trust the SQLite count," which is still
 accurate, just not independently checkable after the fact.
+
+And the third, the one that makes "rows == quantity" a near-equality rather
+than an identity: **the ledger and SQLite are two stores, and two stores cannot
+be committed atomically without a distributed transaction nobody wants in a
+100-line library.** The grant is chained *inside* the SQLite transaction, so a
+ledger failure rolls the count back — that direction is clean. The reverse
+(ledger written, then `COMMIT` fails on a full disk) leaves a chained grant
+SQLite never accepted, and an append-only chain can't have a row removed. So
+since 0.1.2 the meter chains the **inverse**: a `meter.void` row with
+`reason: "commit_failed"`. The invariant you reconcile against is therefore:
+
+```python
+import json
+grants = voids = 0
+for line in open("usage_ledger.jsonl", encoding="utf-8"):
+    row = json.loads(line)
+    if row.get("month") != "2026-08":            # the month you're billing
+        continue
+    grants += row.get("event") == "meter.grant"
+    voids += row.get("event") == "meter.void"
+print(grants - voids)      # == the `used` in export() == the invoice quantity
+```
+
+Run it per key (filter on `key_id` too) and any mismatch is a real event worth
+finding, not noise. If the void append fails as well — the same dying disk,
+twice — the ledger stays ahead of the count, and this is the check that says
+so. A receipt that names its own failure mode is worth more than one that
+doesn't have one on paper.
 
 ## Where the secret key goes
 

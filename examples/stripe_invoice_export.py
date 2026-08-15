@@ -67,14 +67,19 @@ def build_invoice_items(
     month: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """`rows` is `json.loads(meter.export(month=..., fmt="json"))`.
-    `customer_map` is a builder-owned `{key_id: stripe_customer_id}` mapping
-    (how you decide who `key_id` bills to is your call — a DB, a JSON file,
-    whatever mapped `label`/`key_id` to a customer when the key was minted).
+    `customer_map` is a builder-owned `{key_hash: stripe_customer_id}` mapping
+    (how you decide who a key bills to is your call — a DB, a JSON file,
+    whatever mapped the key to a customer when it was minted).
+
+    Keyed on `key_hash`, the FULL sha256, not the 12-hex `key_id`: that prefix
+    is 48 bits and two keys can share one at scale, which would point two
+    customers' invoices at whichever mapping was stored last. `key_id` stays
+    in the human-readable description; identity is the hash.
 
     Returns `(items, skipped)`. Each item dict is shaped for
     `stripe.InvoiceItem.create(**item)` (minus the `idempotency_key`, which
     the caller passes as its own kwarg — see `send_invoice_items`). Every
-    item carries a stable `idempotency_key` of `f"arcaeon-meter:{key_id}:{month}"`
+    item carries a stable `idempotency_key` of `f"arcaeon-meter:{key_hash}:{month}"`
     — re-running this export for a month that was already billed reproduces
     the SAME key, so Stripe returns the original invoice item instead of
     creating a duplicate. That is the whole idempotency story; nothing here
@@ -87,6 +92,9 @@ def build_invoice_items(
     skipped: list[dict[str, Any]] = []
     for row in rows:
         kid = row["key_id"]
+        # pre-0.1.2 exports had no key_hash column; fall back so an archived
+        # export still runs, and say so rather than silently mis-keying.
+        kh = row.get("key_hash") or kid
         used = row.get("used", 0)
         billing_month = row.get("month") or month
         if row.get("revoked"):
@@ -95,11 +103,11 @@ def build_invoice_items(
         if used <= 0:
             skipped.append({"key_id": kid, "reason": "zero_usage", "used": used})
             continue
-        customer_id = customer_map.get(kid)
+        customer_id = customer_map.get(kh) or customer_map.get(kid)
         if not customer_id:
             skipped.append({"key_id": kid, "reason": "no_customer_mapping", "used": used})
             continue
-        idempotency_key = f"arcaeon-meter:{kid}:{billing_month}"
+        idempotency_key = f"arcaeon-meter:{kh}:{billing_month}"
         items.append({
             "customer": customer_id,
             "currency": currency,
@@ -112,6 +120,7 @@ def build_invoice_items(
             "idempotency_key": idempotency_key,
             "metadata": {
                 "arcaeon_meter_key_id": kid,
+                "arcaeon_meter_key_hash": kh,
                 "arcaeon_meter_plan": row.get("plan", "default"),
                 "arcaeon_meter_month": billing_month or "",
                 "arcaeon_meter_used": str(used),
@@ -214,7 +223,10 @@ def _selftest() -> None:
         print("meter.export() rows:")
         print(json.dumps(rows, indent=2))
 
-        customer_map = {kid_a: "cus_test_acme", kid_b: "cus_test_beta"}
+        # map on the FULL hash, not the 12-hex display prefix
+        kh_a, kh_b = (arcaeon_meter.key_hash(secret_a),
+                      arcaeon_meter.key_hash(secret_b))
+        customer_map = {kh_a: "cus_test_acme", kh_b: "cus_test_beta"}
         items, skipped = build_invoice_items(
             rows, customer_map, unit_amount_cents=5, currency="usd",
         )
@@ -226,7 +238,7 @@ def _selftest() -> None:
         by_kid = {it["metadata"]["arcaeon_meter_key_id"]: it for it in items}
         assert by_kid[kid_a]["quantity"] == 7
         assert by_kid[kid_b]["quantity"] == 3
-        assert by_kid[kid_a]["idempotency_key"].startswith(f"arcaeon-meter:{kid_a}:")
+        assert by_kid[kid_a]["idempotency_key"].startswith(f"arcaeon-meter:{kh_a}:")
         # re-running the SAME export produces the SAME idempotency keys —
         # the idempotency story, proven without touching the network.
         rows2 = json.loads(meter.export(fmt="json"))
@@ -244,7 +256,8 @@ def main() -> int:
                     help="run the synthetic self-test (no files, no network)")
     p.add_argument("--keys", type=Path, help="path to arcaeon_meter keys.json")
     p.add_argument("--customer-map", type=Path,
-                    help="JSON file: {key_id: stripe_customer_id}")
+                    help="JSON file: {key_hash: stripe_customer_id} "
+                         "(12-hex key_id keys still resolve, for pre-0.1.2 maps)")
     p.add_argument("--month", default=None, help="YYYY-MM, defaults to current UTC month")
     p.add_argument("--currency", default="usd")
     p.add_argument("--unit-amount-cents", type=int, default=None,

@@ -16,8 +16,12 @@ silent pass. `meter.usage(key)` and `meter.export()` hand the counts to
 your billing flow (CSV/JSON, Stripe-invoice-ready).
 
 Storage: keys live hashed (sha256) in a JSON file — plaintext secrets are
-never at rest. Counts live in SQLite (WAL), incremented inside an IMMEDIATE
-transaction, so concurrent processes don't lose counts.
+never at rest. Counts live in SQLite (WAL), keyed on the FULL key hash and
+incremented inside an IMMEDIATE transaction, so concurrent processes don't
+lose counts and no two customers can share a billing row. (`key_id`, the
+12-hex prefix, is a display label only — 48 bits collide at scale; through
+0.1.1 the counts were keyed on it, which merged colliding customers' usage.
+See the migration note in `Meter._migrate_truncated_keyspace`.)
 
 WHAT IT PROVES, AND WHAT IT DOESN'T. An in-process wrapper meters what the
 meter SAW: calls that go through the decorated path. Code that calls the
@@ -34,6 +38,7 @@ Zero required dependencies (stdlib only). MIT.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import os
@@ -43,11 +48,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = ["Meter", "Allowance", "Denied", "MeterDenied", "Usage",
-           "key_hash", "key_id_of", "KEY_PREFIX"]
+           "key_hash", "key_id_of", "KEY_PREFIX", "LEGACY_KEYSPACE_PREFIX"]
 
 KEY_PREFIX = "am_"  # every issued secret starts with this
+
+# Marker for usage rows migrated out of the pre-0.1.2 truncated keyspace that
+# could not be re-attributed to exactly one key. See `Meter.legacy_usage()`.
+LEGACY_KEYSPACE_PREFIX = "legacy_truncated_keyspace:"
 
 
 def _utc_month() -> str:
@@ -67,8 +76,12 @@ def key_hash(secret: str) -> str:
 def key_id_of(secret: str) -> str:
     """Short public identifier for a key: first 12 hex of its hash.
 
-    Safe to log, export, and show in dashboards; cannot be reversed to the
-    secret and is not sufficient to authenticate.
+    DISPLAY ONLY — not a billing identity. Safe to log, export, and show in
+    dashboards; cannot be reversed to the secret and is not sufficient to
+    authenticate. It is 48 bits, so two keys can share one (birthday odds hit
+    ~50% around 16.7M keys). Counts, caps, and invoice rows are keyed on the
+    FULL sha256 (`key_hash`) precisely so a display collision can never merge
+    two customers' billing; the export carries both.
     """
     return key_hash(secret)[:12]
 
@@ -125,7 +138,11 @@ class Denied:
 
 @dataclass
 class Usage:
-    """Read-only usage snapshot for one key (no increment)."""
+    """Read-only usage snapshot for one key (no increment).
+
+    `key_id` is the 12-hex display prefix; `key_hash` is the full sha256 the
+    count is actually keyed on — the unambiguous billing identity.
+    """
     key_id: str
     plan: str
     used: int
@@ -133,6 +150,7 @@ class Usage:
     month: str
     label: Optional[str] = None
     revoked: bool = False
+    key_hash: Optional[str] = None
 
     @property
     def remaining(self) -> Optional[int]:
@@ -195,18 +213,96 @@ class Meter:
         con.execute("PRAGMA busy_timeout=15000")
         return con
 
+    _CREATE_USAGE = (
+        "CREATE TABLE IF NOT EXISTS usage ("
+        " key_hash TEXT NOT NULL, month TEXT NOT NULL,"
+        " used INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY (key_hash, month))")
+
     def _init_db(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         con = self._connect()
         try:
             con.execute("PRAGMA journal_mode=WAL")
-            con.execute(
-                "CREATE TABLE IF NOT EXISTS usage ("
-                " key_id TEXT NOT NULL, month TEXT NOT NULL,"
-                " used INTEGER NOT NULL DEFAULT 0,"
-                " PRIMARY KEY (key_id, month))")
+            cols = [r[1] for r in con.execute("PRAGMA table_info(usage)")]
+            if cols and "key_hash" not in cols:
+                self._migrate_truncated_keyspace(con)
+            else:
+                con.execute(self._CREATE_USAGE)
         finally:
             con.close()
+
+    def _migrate_truncated_keyspace(self, con: sqlite3.Connection) -> None:
+        """Move a pre-0.1.2 `usage` table off the 48-bit truncated key_id.
+
+        Before 0.1.2 the counts were keyed on `sha256(secret)[:12]`. That is 48
+        bits: two customers sharing those 12 hex shared one billing row, and
+        `export()` invoiced both for the sum. Counting now keys on the full
+        hash, which leaves the old rows to be re-attributed.
+
+        What this can recover: a legacy row whose 12-hex prefix matches
+        EXACTLY ONE key in the current keys file. The roster is the whole
+        universe of keys that could have incremented it, so a single match is
+        the right owner, and the count carries over intact.
+
+        What it cannot: a prefix matching two or more roster keys — the merged
+        row is the defect itself and truncation is not reversible, so there is
+        no honest way to split it. Same for a prefix matching NO roster key
+        (a hand-deleted entry; revoke keeps entries, so this is rare). Those
+        rows are preserved under `legacy_truncated_keyspace:<prefix>` — never
+        billed to anyone, never silently dropped, readable via
+        `legacy_usage()`. The original table is kept as `usage_pre_0_1_2`.
+
+        Caveat, stated rather than papered over: if entries were DELETED from
+        keys.json (not revoked) after they had spent, a surviving key sharing
+        the prefix inherits their counts. Deletion already destroys the
+        evidence; the migration cannot invent it back.
+        """
+        try:
+            roster = list(self._load_keys().keys())
+        except (ValueError, OSError, UnicodeDecodeError) as e:
+            # Migrating without the roster would zero every recoverable count
+            # (i.e. hand every customer their budget back). Fail loud instead.
+            raise RuntimeError(
+                f"{self.db_path}: usage table uses the pre-0.1.2 truncated "
+                f"keyspace and must be migrated, but the keys file "
+                f"{self.keys_path} could not be read — fix the keys file, "
+                f"then reopen the Meter") from e
+        by_prefix: "dict[str, list[str]]" = {}
+        for h in roster:
+            by_prefix.setdefault(h[:12], []).append(h)
+        archive = "usage_pre_0_1_2"
+        n = 1
+        while con.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                          "AND name=?", (archive,)).fetchone():
+            n += 1
+            archive = f"usage_pre_0_1_2_{n}"
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            rows = con.execute("SELECT key_id, month, used FROM usage").fetchall()
+            con.execute(f"ALTER TABLE usage RENAME TO {archive}")
+            con.execute(self._CREATE_USAGE)
+            resolved = orphaned = 0
+            for kid, month, used in rows:
+                matches = by_prefix.get(kid, ())
+                if len(matches) == 1:
+                    target, resolved = matches[0], resolved + 1
+                else:
+                    target = LEGACY_KEYSPACE_PREFIX + str(kid)
+                    orphaned += 1
+                con.execute(
+                    "INSERT INTO usage (key_hash, month, used) VALUES (?,?,?) "
+                    "ON CONFLICT(key_hash, month) DO UPDATE SET used=used+?",
+                    (target, month, used, used))
+            con.execute("COMMIT")
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                con.execute("ROLLBACK")
+            raise
+        self._log("meter.migration", {
+            "from": "key_id_12hex", "to": "key_hash_sha256",
+            "rows": len(rows), "resolved": resolved, "unattributable": orphaned,
+            "archive_table": archive, "at": _now_iso()})
 
     def _load_keys(self) -> "dict[str, dict]":
         """Keys, cached against the file's stat stamp.
@@ -283,9 +379,13 @@ class Meter:
         con = self._connect()
         try:
             con.execute("BEGIN IMMEDIATE")
+            # Counts key on the FULL hash, never the 12-hex display id: that
+            # prefix is 48 bits, and two customers colliding on it used to
+            # share one row — one paying for the other's traffic, both capped
+            # by the sum. `kid` stays a label on the way out.
             row = con.execute(
-                "SELECT used FROM usage WHERE key_id=? AND month=?",
-                (kid, month)).fetchone()
+                "SELECT used FROM usage WHERE key_hash=? AND month=?",
+                (kh, month)).fetchone()
             used = row[0] if row else 0
             if cap is not None and used + cost > cap:
                 con.execute("ROLLBACK")
@@ -293,9 +393,9 @@ class Meter:
                                          key_id=kid, used=used, cap=cap))
             if record:
                 con.execute(
-                    "INSERT INTO usage (key_id, month, used) VALUES (?,?,?) "
-                    "ON CONFLICT(key_id, month) DO UPDATE SET used=used+?",
-                    (kid, month, cost, cost))
+                    "INSERT INTO usage (key_hash, month, used) VALUES (?,?,?) "
+                    "ON CONFLICT(key_hash, month) DO UPDATE SET used=used+?",
+                    (kh, month, cost, cost))
                 used += cost
                 # Chain the grant BEFORE committing the count. The other order
                 # bills for a call whose ledger row was never written and whose
@@ -306,7 +406,22 @@ class Meter:
                 self._log("meter.grant", {"key_id": kid, "plan": plan,
                                           "month": month, "used": used,
                                           "cap": cap, "cost": cost})
-            con.execute("COMMIT")
+            try:
+                con.execute("COMMIT")
+            except BaseException:
+                # The other direction of the same seam: the ledger row is
+                # already chained, and COMMIT just failed (disk full, I/O
+                # error), so SQLite has no such grant. The row cannot be
+                # removed without breaking the chain — so chain its INVERSE.
+                # The receipt invariant is therefore grants MINUS voids ==
+                # the billed count, and it survives a half-failed write.
+                if record:
+                    with contextlib.suppress(Exception):
+                        self._log("meter.void", {
+                            "key_id": kid, "plan": plan, "month": month,
+                            "used": used, "cap": cap, "cost": cost,
+                            "reason": "commit_failed"})
+                raise
         finally:
             con.close()
         return Allowance(key_id=kid, plan=plan, used=used, cap=cap, month=month)
@@ -382,21 +497,48 @@ class Meter:
             if len(matches) > 1:
                 raise KeyError(f"key_id prefix {kid!r} is ambiguous")
             entry = matches[0][1] if matches else None
+            h = matches[0][0] if matches else None
             kid = matches[0][0][:12] if matches else kid
-        if entry is None:
+        if entry is None or h is None:
             raise KeyError(f"unknown key: {key_or_id[:12]}...")
         m = month or _utc_month()
         con = self._connect()
         try:
-            row = con.execute("SELECT used FROM usage WHERE key_id=? AND month=?",
-                              (kid, m)).fetchone()
+            row = con.execute("SELECT used FROM usage WHERE key_hash=? AND month=?",
+                              (h, m)).fetchone()
         finally:
             con.close()
         cap = self._resolve_cap(entry)
-        return Usage(key_id=kid, plan=entry.get("plan", "default"),
+        return Usage(key_id=kid, key_hash=h, plan=entry.get("plan", "default"),
                      used=row[0] if row else 0,
                      cap=None if cap is _NO_CAP else cap, month=m,
                      label=entry.get("label"), revoked=bool(entry.get("revoked")))
+
+    def legacy_usage(self, *, month: "str | None" = None) -> "list[dict]":
+        """Pre-0.1.2 rows the migration could not attribute to exactly one key.
+
+        Empty for any database created at 0.1.2 or later, which is the normal
+        case. A non-empty list means counts exist that the old 48-bit keyspace
+        merged or orphaned: they are preserved, deliberately NOT in `export()`
+        (nobody can be honestly invoiced for them), and this is the reader.
+        `month=None` returns every month.
+        """
+        con = self._connect()
+        try:
+            if month is None:
+                rows = con.execute(
+                    "SELECT key_hash, month, used FROM usage "
+                    "WHERE key_hash LIKE ? ORDER BY month, key_hash",
+                    (LEGACY_KEYSPACE_PREFIX + "%",)).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT key_hash, month, used FROM usage "
+                    "WHERE key_hash LIKE ? AND month=? ORDER BY key_hash",
+                    (LEGACY_KEYSPACE_PREFIX + "%", month)).fetchall()
+        finally:
+            con.close()
+        return [{"legacy_key_id": k[len(LEGACY_KEYSPACE_PREFIX):],
+                 "month": mo, "used": u} for k, mo, u in rows]
 
     def export(self, *, month: "str | None" = None,
                fmt: str = "json") -> str:
@@ -404,27 +546,36 @@ class Meter:
 
         Every key in the keys file appears (zero-usage keys included — an
         invoice run wants the full roster). `fmt` is "json" (a list of row
-        objects) or "csv" (header + rows). Columns: key_id, label, plan,
-        used, monthly_cap, revoked, month. No secrets, no hashes beyond the
-        12-hex key_id.
+        objects) or "csv" (header + rows). Columns: key_id, key_hash, label,
+        plan, used, monthly_cap, revoked, month.
+
+        `key_hash` (full sha256) is the identity to map to a customer:
+        `key_id` is a 12-hex display prefix and two keys CAN share one, which
+        would collapse two invoice lines into one lookup. It is the same
+        one-way hash already stored in keys.json — not a secret, and not
+        reversible to one. Plaintext secrets appear nowhere, as ever.
+
+        Rows the pre-0.1.2 migration could not attribute to one key are
+        deliberately absent (see `legacy_usage()`): nobody can be honestly
+        invoiced for a count that belongs to an unknown owner.
         """
         m = month or _utc_month()
         keys = self._load_keys()
         con = self._connect()
         try:
             counts = dict(con.execute(
-                "SELECT key_id, used FROM usage WHERE month=?", (m,)).fetchall())
+                "SELECT key_hash, used FROM usage WHERE month=?", (m,)).fetchall())
         finally:
             con.close()
         rows = []
         for h, entry in sorted(keys.items()):
-            kid = h[:12]
             cap = self._resolve_cap(entry)
             rows.append({
-                "key_id": kid,
+                "key_id": h[:12],
+                "key_hash": h,
                 "label": entry.get("label"),
                 "plan": entry.get("plan", "default"),
-                "used": counts.get(kid, 0),
+                "used": counts.get(h, 0),
                 "monthly_cap": None if cap is _NO_CAP else cap,
                 "revoked": bool(entry.get("revoked")),
                 "month": m,
@@ -436,8 +587,8 @@ class Meter:
             import csv as _csv
             import io as _io
             buf = _io.StringIO()
-            cols = ["key_id", "label", "plan", "used", "monthly_cap",
-                    "revoked", "month"]
+            cols = ["key_id", "key_hash", "label", "plan", "used",
+                    "monthly_cap", "revoked", "month"]
             w = _csv.DictWriter(buf, fieldnames=cols, lineterminator="\n")
             w.writeheader()
             w.writerows(rows)
@@ -445,7 +596,7 @@ class Meter:
         raise ValueError(f"fmt must be 'json' or 'csv', not {fmt!r}")
 
     # -- http helper --------------------------------------------------------
-    def asgi_middleware(self):
+    def asgi_middleware(self, *, skip_methods: "tuple[str, ...]" = ("OPTIONS",)):
         """A pure-ASGI middleware class checking `Authorization: Bearer <key>`.
 
         Works with FastAPI/Starlette (`app.add_middleware(meter.asgi_middleware())`)
@@ -454,9 +605,18 @@ class Meter:
         answer 401 (missing/unknown/revoked key) or 429 (over cap) with a
         JSON body naming the reason; grants stash the `Allowance` at
         `scope["arcaeon_meter"]` for your handlers.
+
+        `skip_methods` are passed through unmetered and unauthenticated
+        (`scope["arcaeon_meter"] = None`). The default exists for CORS: a
+        browser preflight is a protocol question, not a call — and it carries
+        no Authorization header, so metering it both billed a non-call and
+        answered 401, which breaks CORS outright. Add `"HEAD"` if you do not
+        consider a HEAD a billable call. Everything else IS billed at
+        dispatch, including requests your handler answers 5xx — see the
+        README's billing-policy note for why that ordering is deliberate.
         """
         from arcaeon_meter.asgi import build_middleware
-        return build_middleware(self)
+        return build_middleware(self, skip_methods=skip_methods)
 
 
 class _NoCapSentinel:

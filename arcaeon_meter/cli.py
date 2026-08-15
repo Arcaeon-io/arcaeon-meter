@@ -116,6 +116,16 @@ def main(argv: "list[str] | None" = None) -> int:
         print(meter.export(month=args.month, fmt=args.fmt), end="")
         if args.fmt == "json":
             print()
+        # An invoice run is exactly when someone must be told that counts
+        # exist which nobody can honestly be billed for.
+        stranded = meter.legacy_usage(month=args.month)
+        if stranded:
+            total = sum(r["used"] for r in stranded)
+            print(f"warning: {len(stranded)} pre-0.1.2 usage row(s) totaling "
+                  f"{total} call(s) could not be attributed to a single key "
+                  f"(48-bit key_id collision or a deleted key entry) and are "
+                  f"NOT in this export. See Meter.legacy_usage().",
+                  file=sys.stderr)
         return 0
 
     return 2  # pragma: no cover

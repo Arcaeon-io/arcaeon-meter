@@ -13,6 +13,20 @@ Denial mapping:
   429  over_cap  (plus X-Meter-Cap / X-Meter-Used headers)
 Grants stash the `Allowance` at scope["arcaeon_meter"].
 
+BILLING POLICY, stated so nobody discovers it on an invoice:
+  * `OPTIONS` is not metered (default `skip_methods`). A CORS preflight is
+    the browser asking whether it may call, and it does not carry the
+    Authorization header — metering it billed a non-call AND answered 401,
+    which breaks the very CORS handshake it was inspecting.
+  * every other method, `HEAD` included, is billed once at dispatch. Pass
+    `skip_methods=("OPTIONS", "HEAD")` if a HEAD is not a call to you.
+  * a request whose handler raises or answers 5xx is STILL billed. The cap
+    has to be spent before the work runs (that is what makes it a cap and
+    what makes it atomic across processes), and a refund would need a
+    negative cost — deliberately refused since 0.1.1, because a public
+    negative cost is a budget-minting hole. If you need failed calls
+    forgiven, credit them in your billing flow, where the money is.
+
 Note for the pedantic (correctly so): the key check is a synchronous
 single-row SQLite transaction run on the event loop. At micro-tool scale
 that's microseconds; if you're serving thousands of requests a second,
@@ -24,14 +38,16 @@ from __future__ import annotations
 import json
 
 
-def build_middleware(meter):
+def build_middleware(meter, *, skip_methods=("OPTIONS",)):
     """Return a middleware CLASS bound to `meter` (Starlette's
     `add_middleware` instantiates it with the downstream app)."""
+    skip = frozenset(m.upper() for m in (skip_methods or ()))
 
     class MeterMiddleware:
         def __init__(self, app):
             self.app = app
             self.meter = meter
+            self.skip_methods = skip
 
         async def __call__(self, scope, receive, send):
             stype = scope.get("type")
@@ -47,6 +63,14 @@ def build_middleware(meter):
                 # than meter it wrong; meter the handshake yourself if you
                 # need WS traffic counted.
                 await send({"type": "websocket.close", "code": 1008})
+                return
+            method = str(scope.get("method") or "").upper()
+            if method in self.skip_methods:
+                # Not a call. Not billed, not authenticated, not denied — a
+                # preflight answered 401 is a CORS failure, not a metering
+                # decision. Handlers can tell by the None.
+                scope["arcaeon_meter"] = None
+                await self.app(scope, receive, send)
                 return
             key = None
             for name, value in scope.get("headers") or []:

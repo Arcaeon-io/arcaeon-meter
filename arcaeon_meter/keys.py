@@ -183,11 +183,16 @@ def revoke_key(path: "str | Path", ident: str) -> str:
 
 def list_keys(path: "str | Path") -> "list[dict]":
     """All entries with their public key_ids — never secrets (none exist
-    at rest to leak)."""
+    at rest to leak).
+
+    `key_id` is the 12-hex display prefix; `key_hash` is the full sha256 that
+    counts and invoice rows are keyed on (two keys can share a prefix, so the
+    prefix is a label, not an identity).
+    """
     doc = load(path)
     out = []
     for h, entry in sorted(doc["keys"].items()):
-        row = {"key_id": h[:12]}
+        row = {"key_id": h[:12], "key_hash": h}
         row.update(entry)
         out.append(row)
     return out
