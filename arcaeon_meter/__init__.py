@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["Meter", "Allowance", "Denied", "MeterDenied", "Usage",
            "key_hash", "key_id_of", "KEY_PREFIX"]
 
@@ -99,9 +99,18 @@ class Denied:
     - "unknown_key"       key not in the keys file
     - "revoked"           key exists but was revoked
     - "over_cap"          monthly cap reached (used/cap filled in)
-    - "no_cap_configured" key has no cap and its plan resolves to none —
-                          the meter fails CLOSED rather than silently
-                          treating a misconfigured key as unlimited
+    - "no_cap_configured" key has no cap, its plan resolves to none, or the
+                          configured cap is not a cap (NaN, Infinity, "100",
+                          a list, a negative) — the meter fails CLOSED rather
+                          than silently treating a misconfigured key as
+                          unlimited
+    - "malformed_key"     the presented key is not a usable string (wrong
+                          type, or un-encodable text like a lone surrogate,
+                          which is legal JSON and therefore arrives from
+                          the wire)
+    - "keys_unreadable"   the keys file exists but cannot be parsed. Not the
+                          same as "no keys": the authorization record can't
+                          be read, so nothing is authorized
     """
     reason: str
     month: str
@@ -200,14 +209,28 @@ class Meter:
             con.close()
 
     def _load_keys(self) -> "dict[str, dict]":
+        """Keys, cached against the file's stat stamp.
+
+        A missing file is an empty roster (every key then denies as
+        unknown_key — fail closed). An UNREADABLE file is different: it is
+        not "no keys," it is "the authorization record cannot be read," and
+        that raises so `check()` can turn it into a typed keys_unreadable
+        denial instead of blowing up three frames down in `json`.
+        """
         try:
-            mtime = self.keys_path.stat().st_mtime
+            st = self.keys_path.stat()
         except OSError:
             return {}
-        if self._keys_mtime != mtime:
+        # size + inode alongside mtime: a coarse-granularity filesystem
+        # (FAT/ext3/many network mounts) or a timestamp-preserving copy
+        # (rsync -t, restore-from-backup) can change content without moving
+        # mtime, which would leave a revoked key spending until restart.
+        stamp = (getattr(st, "st_mtime_ns", st.st_mtime), st.st_size,
+                 getattr(st, "st_ino", 0), getattr(st, "st_ctime_ns", 0))
+        if self._keys_mtime != stamp:
             from arcaeon_meter.keys import load
             self._keys_cache = load(self.keys_path).get("keys", {})
-            self._keys_mtime = mtime
+            self._keys_mtime = stamp
         return self._keys_cache
 
     # -- the verb -----------------------------------------------------------
@@ -223,11 +246,32 @@ class Meter:
         workers can't both take the last slot under the cap.
         """
         month = _utc_month()
+        # `cost` is a public kwarg and the SQL is `used = used + ?`. A negative
+        # cost is an unbounded refund that persists in SQLite across processes;
+        # cost=0 is unlimited free calls at the cap. Neither is a metering
+        # event, so neither is accepted — loudly, before anything is read.
+        if isinstance(cost, bool) or not isinstance(cost, int) or cost < 1:
+            raise ValueError(f"cost must be a positive int, got {cost!r}")
         if not key:
             return self._deny(Denied(reason="missing_key", month=month))
-        entry = self._load_keys().get(key_hash(key))
-        kid = key_id_of(key)
-        if entry is None:
+        # A key arrives from the wire. It may be any JSON value, including a
+        # lone surrogate (legal JSON, un-encodable UTF-8). Every one of those
+        # used to escape `except MeterDenied` as a raw TypeError/
+        # UnicodeEncodeError and 500 instead of 401.
+        if not isinstance(key, str):
+            return self._deny(Denied(reason="malformed_key", month=month))
+        try:
+            kh, kid = key_hash(key), key_id_of(key)
+        except (UnicodeEncodeError, ValueError, TypeError):
+            return self._deny(Denied(reason="malformed_key", month=month))
+        try:
+            entry = self._load_keys().get(kh)
+        except (ValueError, OSError, UnicodeDecodeError):
+            # corrupt / truncated / not-a-keys-file: we cannot read the
+            # authorization record, so we do not authorize.
+            return self._deny(Denied(reason="keys_unreadable", month=month,
+                                     key_id=kid))
+        if not isinstance(entry, dict):
             return self._deny(Denied(reason="unknown_key", month=month, key_id=kid))
         if entry.get("revoked"):
             return self._deny(Denied(reason="revoked", month=month, key_id=kid))
@@ -253,25 +297,44 @@ class Meter:
                     "ON CONFLICT(key_id, month) DO UPDATE SET used=used+?",
                     (kid, month, cost, cost))
                 used += cost
+                # Chain the grant BEFORE committing the count. The other order
+                # bills for a call whose ledger row was never written and whose
+                # caller got an exception instead of the work — and verify()
+                # reports ok across that gap, because the gap is a missing row,
+                # not an altered one. If the log can't be written, the count
+                # rolls back and nobody is charged.
+                self._log("meter.grant", {"key_id": kid, "plan": plan,
+                                          "month": month, "used": used,
+                                          "cap": cap, "cost": cost})
             con.execute("COMMIT")
         finally:
             con.close()
-        allowance = Allowance(key_id=kid, plan=plan, used=used, cap=cap, month=month)
-        if record:
-            self._log("meter.grant", {"key_id": kid, "plan": plan, "month": month,
-                                      "used": used, "cap": cap, "cost": cost})
-        return allowance
+        return Allowance(key_id=kid, plan=plan, used=used, cap=cap, month=month)
+
+    @staticmethod
+    def _valid_cap(cap: Any) -> bool:
+        """A cap is None (explicit unlimited) or a non-negative int. NOT a
+        float: `used + cost > nan` and `> inf` are both False, so a NaN or
+        Infinity cap read straight out of a keys file was a silent unlimited
+        grant — and `json.loads` accepts the bare `NaN`/`Infinity` literals,
+        so it round-trips through this package's own writer. NOT a str or a
+        list either: those raised a TypeError from the comparison."""
+        if cap is None:
+            return True
+        return isinstance(cap, int) and not isinstance(cap, bool) and cap >= 0
 
     def _resolve_cap(self, entry: dict) -> "int | None | object":
         """Entry's own monthly_cap wins; else the plan default; else _NO_CAP
         (fail closed — an unconfigured key is not silently unlimited).
         Unlimited must be EXPLICIT: `"monthly_cap": null` in the entry, or a
-        None plan default."""
+        None plan default. A cap that isn't a cap is _NO_CAP, never a pass."""
         if "monthly_cap" in entry:
-            return entry["monthly_cap"]  # may be None = explicit unlimited
+            cap = entry["monthly_cap"]
+            return cap if self._valid_cap(cap) else _NO_CAP
         plan = entry.get("plan")
-        if plan in self.plans:
-            return self.plans[plan]
+        if isinstance(plan, str) and plan in self.plans:
+            cap = self.plans[plan]
+            return cap if self._valid_cap(cap) else _NO_CAP
         return _NO_CAP
 
     def _deny(self, d: Denied) -> Denied:
@@ -303,11 +366,17 @@ class Meter:
         """Usage snapshot (no increment) by secret or by 12-hex key_id.
         Raises KeyError for a key the keys file doesn't know."""
         keys = self._load_keys()
+        if not isinstance(key_or_id, str):
+            raise KeyError(f"key must be a string, got {type(key_or_id).__name__}")
         if key_or_id.startswith(KEY_PREFIX):
             h = key_hash(key_or_id)
             entry = keys.get(h)
             kid = h[:12]
         else:
+            if len(key_or_id) < 6:
+                # "" is a prefix of every hash — it would report a key at random.
+                raise KeyError(f"key_id {key_or_id!r} is too short to be "
+                               f"unambiguous (need at least 6 hex chars)")
             kid = key_or_id
             matches = [(h, e) for h, e in keys.items() if h.startswith(kid)]
             if len(matches) > 1:

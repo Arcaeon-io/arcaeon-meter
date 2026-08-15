@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arcaeon-meter"
-version = "0.1.0"
+version = "0.1.1"
 description = "Meter your agent tool in 3 lines: keys, monthly caps, SQLite counts, billing export. Keyed metering without billing infrastructure."
 readme = "README.md"
 requires-python = ">=3.9"

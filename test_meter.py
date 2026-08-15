@@ -287,6 +287,232 @@ def test_cli_add_list_revoke_usage_export():
     print("PASS CLI keys add/list/revoke + usage + export round-trip")
 
 
+
+
+# --- audit 2026-08-14: fail-closed holes ------------------------------------
+
+def _write_keys(kp: Path, entry: dict) -> str:
+    """Hand-write a keys file with an arbitrary entry, return the secret.
+
+    Deliberately bypasses keys.save() — the point is a file that a hand-edit,
+    a config generator, or an older release could have produced. save() now
+    refuses NaN on the way out; the reader still has to refuse it on the way
+    in, because the writer is not the only thing that writes this file.
+    """
+    from arcaeon_meter.keys import new_secret
+    from arcaeon_meter import key_hash
+    secret = new_secret()
+    kp.write_text(json.dumps({"version": 1, "keys": {key_hash(secret): entry}}),
+                  encoding="utf-8")
+    return secret
+
+
+def test_nonsense_cap_is_denied_not_unlimited():
+    """`used + cost > cap` is False for NaN and for +Infinity, so a NaN cap
+    was a silent unlimited grant -- and json.loads accepts the bare literal
+    NaN, so it round-trips through this package's own writer. A cap that is
+    not a non-negative int is not a cap."""
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        for label, cap in [("NaN", float("nan")), ("Inf", float("inf")),
+                           ("string", "2"), ("list", []), ("negative", -5),
+                           ("float", 2.5), ("bool", True)]:
+            kp = d / ("keys_" + label + ".json")
+            secret = _write_keys(kp, {"plan": "free", "monthly_cap": cap,
+                                      "revoked": False})
+            m = Meter(kp, db=d / ("u_" + label + ".sqlite3"))
+            r = m.check(secret)
+            assert not r, "cap=" + label + " GRANTED -- that is unlimited access"
+            # NaN/Inf die at the JSON parse (they are not JSON); the rest die
+            # at cap resolution. Both are typed denials, which is the claim.
+            assert r.reason in ("no_cap_configured", "keys_unreadable"), \
+                (label, r.reason)
+            if label not in ("NaN", "Inf"):
+                assert r.reason == "no_cap_configured", (label, r.reason)
+    print("PASS a NaN/Inf/string/negative/float cap fails closed, never unlimited")
+
+
+def test_nonsense_plan_default_is_denied_not_unlimited():
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        kp = d / "keys.json"
+        secret = _write_keys(kp, {"plan": "weird", "revoked": False})
+        m = Meter(kp, db=d / "u.sqlite3", plans={"weird": float("nan")})
+        r = m.check(secret)
+        assert not r and r.reason == "no_cap_configured", r
+    print("PASS a nonsense plan default fails closed too")
+
+
+def test_cost_must_be_a_positive_int():
+    """`cost` is a public kwarg and the SQL is `used = used + ?`. A negative
+    cost mints budget that persists in SQLite forever; cost=0 is unlimited
+    free calls at the cap. Neither one is a metering event."""
+    with tempfile.TemporaryDirectory() as td:
+        meter, kp, secret, kid = _mk(Path(td))
+        for bad in (-1000, 0, 0.4, True, "1", None):
+            try:
+                meter.check(secret, cost=bad)
+                assert False, "cost=" + repr(bad) + " accepted"
+            except ValueError:
+                pass
+        assert meter.usage(kid).used == 0, "a refused cost still moved the counter"
+    print("PASS cost must be a positive int; no budget minting, no free calls")
+
+
+def test_malformed_key_is_a_typed_denial_not_a_crash():
+    """A lone surrogate is LEGAL JSON, so any tool reading its key from a
+    request body can be handed one. It escaped `except MeterDenied` as a
+    UnicodeEncodeError and 500'd instead of 401'ing."""
+    with tempfile.TemporaryDirectory() as td:
+        meter, kp, secret, kid = _mk(Path(td))
+        for bad in (12345, b"am_bytes", ["am_x"], "am_\ud800", {"k": 1}):
+            r = meter.check(bad)
+            assert not r, repr(bad) + " granted"
+            assert r.reason == "malformed_key", (bad, r.reason)
+
+        @meter.metered
+        def tool(_meter_key=None):
+            return "ran"
+
+        for bad in (12345, "am_\ud800"):
+            try:
+                tool(_meter_key=bad)
+                assert False, "malformed key ran the tool"
+            except MeterDenied:
+                pass
+    print("PASS a malformed key is a typed denial, catchable as MeterDenied")
+
+
+def test_unreadable_keys_file_is_a_typed_denial():
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        meter, kp, secret, kid = _mk(d)
+        assert meter.check(secret)
+        for corruption in ('{"version": 1, "keys": {', "[]", "not json at all"):
+            kp.write_text(corruption, encoding="utf-8")
+            meter._keys_mtime = None          # force a re-read
+            r = meter.check(secret)
+            assert not r, "granted on corrupt keys file: " + repr(corruption)
+            assert r.reason == "keys_unreadable", r.reason
+    print("PASS a corrupt/truncated keys file denies, typed, instead of raising")
+
+
+def test_entry_that_is_not_a_dict_denies():
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        kp = d / "keys.json"
+        from arcaeon_meter.keys import new_secret, save
+        secret = new_secret()
+        save(kp, {"version": 1, "keys": {arcaeon_meter.key_hash(secret): "oops"}})
+        m = Meter(kp, db=d / "u.sqlite3")
+        r = m.check(secret)
+        assert not r and r.reason == "unknown_key", r
+    print("PASS a non-dict key entry denies instead of AttributeError")
+
+
+def test_asgi_never_waves_through_an_unmetered_protocol():
+    """websocket scopes skipped the meter entirely -- an unkeyed, uncapped
+    streaming endpoint behind middleware whose whole job is the boundary."""
+    with tempfile.TemporaryDirectory() as td:
+        meter, kp, secret, kid = _mk(Path(td))
+        reached = []
+
+        async def app(scope, receive, send):
+            reached.append(scope["type"])
+
+        wrapped = meter.asgi_middleware()(app)
+        sent = []
+
+        async def send(msg):
+            sent.append(msg)
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        asyncio.run(wrapped({"type": "websocket", "headers": []}, receive, send))
+        assert reached == [], "unmetered websocket reached the app: " + str(reached)
+        assert sent and sent[0]["type"] == "websocket.close", sent
+
+        asyncio.run(wrapped({"type": "lifespan", "headers": []}, receive, send))
+        assert reached == ["lifespan"], "lifespan must still pass through"
+    print("PASS a websocket scope is closed, not waved through unmetered")
+
+
+def test_ledger_failure_rolls_the_count_back():
+    """The grant was chained AFTER commit, so a ledger write failure left the
+    customer billed for a call that raised before it ran. A retry billed
+    again, and verify() reported ok across the gap."""
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        meter, kp, secret, kid = _mk(d, ledger=str(d / "log.jsonl"))
+        assert meter.check(secret)
+        assert meter.usage(kid).used == 1
+
+        class Boom:
+            def append(self, row):
+                raise OSError("ledger volume is read-only")
+
+        meter._ledger = Boom()
+        try:
+            meter.check(secret)
+        except OSError:
+            pass
+        assert meter.usage(kid).used == 1, \
+            "counted a call whose ledger row was never written"
+    print("PASS a failed ledger write rolls the count back instead of over-billing")
+
+
+def test_empty_identifier_never_resolves_to_a_key():
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        meter, kp, secret, kid = _mk(d)
+        for bad in ("", "a", "abc"):
+            try:
+                revoke_key(kp, bad)
+                assert False, "revoked a key by prefix " + repr(bad)
+            except KeyError:
+                pass
+            try:
+                meter.usage(bad)
+                assert False, "reported usage for prefix " + repr(bad)
+            except KeyError:
+                pass
+    print("PASS a short/empty key_id prefix never resolves to an arbitrary key")
+
+
+def test_concurrent_revoke_is_not_erased_by_a_concurrent_add():
+    """add_key and revoke_key are load-mutate-save with no lock, so a
+    concurrent add rewrote the whole document from a stale read and silently
+    un-revoked the key -- while the CLI reported the revocation succeeded."""
+    import threading
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        kp = d / "keys.json"
+        secret, kid = add_key(kp, plan="free", monthly_cap=5)
+        errors = []
+
+        def adder(n):
+            try:
+                for _ in range(n):
+                    add_key(kp, plan="free", monthly_cap=5)
+            except Exception as e:      # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=adder, args=(15,)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        revoke_key(kp, kid)
+        for t in threads:
+            t.join()
+        assert not errors, "concurrent writers crashed: " + str(errors[:2])
+        entries = {r["key_id"]: r for r in list_keys(kp)}
+        assert len(entries) == 61, "lost writes: expected 61 keys, got " + str(len(entries))
+        assert entries[kid]["revoked"] is True, "the revocation was erased"
+        m = Meter(kp, db=d / "u.sqlite3")
+        assert not m.check(secret), "a revoked key is still spending"
+    print("PASS a revocation survives concurrent key adds; no lost writes")
+
+
 if __name__ == "__main__":
     test_three_line_promise_and_grant_path()
     test_over_cap_denied_typed_never_silent()
@@ -301,4 +527,14 @@ if __name__ == "__main__":
     test_ledger_missing_dep_is_loud()
     test_asgi_middleware_pure_asgi()
     test_cli_add_list_revoke_usage_export()
+    test_nonsense_cap_is_denied_not_unlimited()
+    test_nonsense_plan_default_is_denied_not_unlimited()
+    test_cost_must_be_a_positive_int()
+    test_malformed_key_is_a_typed_denial_not_a_crash()
+    test_unreadable_keys_file_is_a_typed_denial()
+    test_entry_that_is_not_a_dict_denies()
+    test_asgi_never_waves_through_an_unmetered_protocol()
+    test_ledger_failure_rolls_the_count_back()
+    test_empty_identifier_never_resolves_to_a_key()
+    test_concurrent_revoke_is_not_erased_by_a_concurrent_add()
     print("ALL PASS")

@@ -34,8 +34,19 @@ def build_middleware(meter):
             self.meter = meter
 
         async def __call__(self, scope, receive, send):
-            if scope.get("type") != "http":
+            stype = scope.get("type")
+            if stype == "lifespan":
+                # Startup/shutdown, not a caller. Must pass through.
                 await self.app(scope, receive, send)
+                return
+            if stype != "http":
+                # Anything else — websocket above all — used to be waved
+                # through unkeyed and uncapped, which is the one thing
+                # boundary middleware exists not to do. A streaming endpoint
+                # is exactly where unbounded work hides. Refuse it rather
+                # than meter it wrong; meter the handshake yourself if you
+                # need WS traffic counted.
+                await send({"type": "websocket.close", "code": 1008})
                 return
             key = None
             for name, value in scope.get("headers") or []:

@@ -121,4 +121,17 @@ moves in *your* billing flow — this library feeds it and stays out of it. If y
 crypto-native machine payments (x402 et al.), that's a different rail; keyed metering
 is the one that bills today.
 
+**And the one that will bite you: the usage DB is state, so treat it like state.**
+Counts live in SQLite next to the keys file. Delete it, forget to mount the
+volume, `git clean` it, rebuild the container without a persistent path — and
+every exhausted budget is full again, silently, because an empty counts table
+is indistinguishable from a fresh install. Put the DB on a persistent volume,
+back it up with the keys file, and if you want a second copy that can't be lost
+this way, run with `ledger=` — every grant is a chained row you can re-total.
+Metering is only as durable as the thing counting.
+
+Also: only HTTP scopes are metered by the ASGI middleware. WebSocket
+connections are refused rather than waved through — if you need WS traffic
+metered, meter the handshake yourself.
+
 MIT. Built by [Arcaeon](https://arcaeon.io) — the evidence layer for AI.
