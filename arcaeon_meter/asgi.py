@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Pure-ASGI bearer-key middleware for arcaeon_meter.
 
 No framework required: this speaks the ASGI protocol directly, so it wraps

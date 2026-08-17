@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Key management for arcaeon_meter.
 
 Secrets are random (`secrets.token_urlsafe`), shown ONCE at creation, and
@@ -69,17 +70,37 @@ def _locked(path: "str | Path", timeout: float = 10.0):
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_RDWR)
             break
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             # A stale lock from a killed process shouldn't wedge the file
             # forever; past the deadline, break it rather than deadlock.
+            #
+            # On Windows, DeleteFile (os.unlink) is not atomic the way POSIX
+            # unlink is: a file mid-delete-pending sits in a state where a
+            # competing CreateFile (os.open) fails with ERROR_ACCESS_DENIED
+            # -- surfaced in Python as PermissionError, not FileExistsError
+            # -- even though no other handle actually holds the lock. The
+            # loser of the close()/unlink() race in the `finally` below can
+            # therefore see PermissionError instead of "lock held"; treat it
+            # the same way (retry), since it means exactly the same thing:
+            # someone else has (or just had) this lock.
+            #
+            # The deadline is enforced FIRST, on every iteration. It used to
+            # live below the stat() probe, and the stat-failure path skipped
+            # it (and the sleep) entirely -- but stat() failing is the COMMON
+            # case under contention: the holder unlinks the lock between our
+            # failed open and our stat. That path was an unbounded busy-spin
+            # with no timeout, which is exactly the shape of "flaky only when
+            # the machine is loaded."
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"could not lock {path} within {timeout}s")
             try:
                 if time.time() - lock.stat().st_mtime > timeout * 2:
                     os.unlink(lock)
                     continue
             except OSError:
-                continue
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"could not lock {path} within {timeout}s")
+                # Lock vanished (holder released it) or is delete-pending;
+                # fall through to the sleep and retry the open.
+                pass
             time.sleep(0.01)
     try:
         yield
@@ -107,14 +128,26 @@ def save(path: "str | Path", doc: dict) -> None:
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
-        for attempt in range(50):
+        # Bounded time-budget retry, not a fixed iteration count. The old
+        # loop (50 x 20 ms = 1.0 s flat) was empirically too tight on a
+        # loaded Windows box: besides our own readers, EXTERNAL scanners
+        # (Defender real-time scan, the search indexer) open freshly written
+        # .json files without FILE_SHARE_DELETE, and under load that hold can
+        # outlive a fixed 1 s -- the retry exhausted and PermissionError
+        # escaped into callers (the concurrency suite caught it as a flake).
+        # Exponential backoff under a 10 s ceiling rides out a scanner hold
+        # without busy-hammering the file; still bounded, still raises.
+        deadline = time.monotonic() + 10.0
+        delay = 0.01
+        while True:
             try:
                 os.replace(tmp, str(p))
                 break
             except PermissionError:
-                if attempt == 49:
+                if time.monotonic() > deadline:
                     raise
-                time.sleep(0.02)
+                time.sleep(delay)
+                delay = min(delay * 2, 0.25)
     except BaseException:
         try:
             os.unlink(tmp)

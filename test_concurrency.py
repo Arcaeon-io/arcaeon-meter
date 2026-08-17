@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Concurrency sanity for arcaeon_meter — two real OS processes hammer the
 same meter. Two claims under test:
 

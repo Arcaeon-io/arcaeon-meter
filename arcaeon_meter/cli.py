@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """CLI for arcaeon_meter.
 
     python -m arcaeon_meter keys add    [--keys keys.json] [--plan free]

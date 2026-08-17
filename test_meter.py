@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Tests for arcaeon_meter — the product claim is 'caps are enforced, never
 a silent pass,' so the denial paths (revoked, over-cap, unconfigured) are
 the load-bearing tests. Run: python test_meter.py

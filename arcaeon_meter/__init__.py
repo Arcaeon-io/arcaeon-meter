@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """arcaeon_meter — keyed usage metering for agent tools, in 3 lines.
 
 You built a tool agents want to call. Now you need keys, per-key monthly
@@ -48,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __all__ = ["Meter", "Allowance", "Denied", "MeterDenied", "Usage",
            "key_hash", "key_id_of", "KEY_PREFIX", "LEGACY_KEYSPACE_PREFIX"]
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """examples/stripe_invoice_export.py — arcaeon-meter usage export -> Stripe invoice.
 
 Turns a month's `meter.export()` into billed Stripe invoice items, one per

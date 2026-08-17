@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Property-based / fuzzing hardening for arcaeon_meter.
 
 Hand-written tests check the cases we thought of. This file drives thousands of

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 from arcaeon_meter.cli import main
 
 if __name__ == "__main__":
